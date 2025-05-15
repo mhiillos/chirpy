@@ -2,6 +2,7 @@ package auth
 
 import (
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -65,5 +66,19 @@ func TestJWT(t *testing.T) {
 		t.Fatalf("Expected error: %v, but got nil", expectedErr.Error())
 	} else if !strings.Contains(err.Error(), expectedErr.Error()) {
 			t.Fatalf("Expected error message: %v, but got: %v", expectedErr.Error(), err.Error())
+	}
+}
+
+func TestGetBearerToken(t *testing.T) {
+	headers := make(http.Header)
+	headers["Authorization"] = []string{"Bearer mytokenstring"}
+
+	bearerToken, err := GetBearerToken(headers)
+	if err != nil {
+		t.Fatalf("Bearer token not found")
+	}
+
+	if bearerToken != "mytokenstring" {
+		t.Fatalf("Bearer token not correct: expected 'mytokenstring', got %q", bearerToken)
 	}
 }

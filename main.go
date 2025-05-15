@@ -24,6 +24,7 @@ type apiConfig struct {
 	fileServerHits atomic.Int32
 	db *database.Queries
 	platform string
+	secret string
 }
 
 type User struct {
@@ -31,6 +32,7 @@ type User struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Email string        `json:"email"`
+	Token string        `json:"token"`
 }
 
 type Chirp struct {
@@ -183,12 +185,25 @@ func (cfg *apiConfig) addUserHandler(w http.ResponseWriter, req *http.Request) {
 func (cfg *apiConfig) postChirpHandler(w http.ResponseWriter, req *http.Request) {
 	type chirpBody struct {
 		Body string      `json:"body"`
-		UserId uuid.UUID `json:"user_id"`
 	}
+
+	// Extract token
+	tokenString, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "No valid token provided")
+		return
+	}
+
+	userID, err := auth.ValidateJWT(tokenString, cfg.secret)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Invalid token")
+		return
+	}
+
 
 	decoder := json.NewDecoder(req.Body)
 	body := chirpBody{}
-	err := decoder.Decode(&body)
+	err = decoder.Decode(&body)
 	if err != nil {
 		respondWithError(w, 500, fmt.Sprintf("Error decoding request body: %s", err))
 	}
@@ -205,7 +220,7 @@ func (cfg *apiConfig) postChirpHandler(w http.ResponseWriter, req *http.Request)
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 		Body: cleanedBody,
-		UserID: body.UserId,
+		UserID: userID,
 	})
 	if err != nil {
 		respondWithError(w, 500, fmt.Sprintf("Error creating chirp: %s", err))
@@ -262,8 +277,9 @@ func (cfg *apiConfig) getChirpHandler(w http.ResponseWriter, req *http.Request) 
 
 func (cfg *apiConfig) loginHandler(w http.ResponseWriter, req *http.Request) {
 	type requestBody struct {
-		Password string `json:"password"`
-		Email string    `json:"email"`
+		Password string      `json:"password"`
+		Email string         `json:"email"`
+		ExpiresInSeconds int `json:"expires_in_seconds"`
 	}
 
 	decoder := json.NewDecoder(req.Body)
@@ -291,11 +307,25 @@ func (cfg *apiConfig) loginHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	expiryTimeSeconds := reqBody.ExpiresInSeconds
+
+	// Token has duration up to one hour
+	expiryTimeSeconds = min(expiryTimeSeconds, 3600)
+	if expiryTimeSeconds <= 0 {
+		// Default: 1 hour
+		expiryTimeSeconds = 3600
+	}
+	tokenString, err := auth.MakeJWT(user.ID, cfg.secret, time.Duration(expiryTimeSeconds) * time.Second)
+	if err != nil {
+		respondWithError(w, 500, err.Error())
+	}
+
 	userResponse := User{
 		Id: user.ID,
 		CreatedAt: user.CreatedAt,
 		UpdatedAt: user.UpdatedAt,
 		Email: user.Email,
+		Token: tokenString,
 	}
 	respondWithJSON(w, 200, userResponse)
 }
@@ -304,6 +334,8 @@ func main() {
 	godotenv.Load(".env")
 	dbURL := os.Getenv("DB_URL")
 	platform := os.Getenv("PLATFORM")
+	secret := os.Getenv("SECRET_KEY")
+
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		log.Fatal(err)
@@ -315,6 +347,8 @@ func main() {
 	newDb := database.New(db)
 	apiCfg.db = newDb
 	apiCfg.platform = platform
+	apiCfg.secret = secret
+
 	mux.Handle("/app/", apiCfg.middlewareMetricsInc(handler))
 	server := http.Server{ Handler: mux, Addr: ":8080" }
 
