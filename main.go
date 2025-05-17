@@ -270,7 +270,7 @@ func (cfg *apiConfig) getChirpHandler(w http.ResponseWriter, req *http.Request) 
 	}
 	chirpDb, err := cfg.db.GetChirp(req.Context(), uuid.UUID(chirpID))
 	if err != nil {
-		respondWithError(w, 500, fmt.Sprintf("Could not find chirp: %s", err))
+		respondWithError(w, 404, fmt.Sprintf("Chirp not found"))
 		return
 	}
 	chirp := Chirp {
@@ -453,6 +453,44 @@ func (cfg *apiConfig) putUsersHandler(w http.ResponseWriter, req *http.Request) 
 	})
 }
 
+// Handler to delete a chirp
+func (cfg *apiConfig) deleteChirpHandler(w http.ResponseWriter, req *http.Request) {
+	chirpID, err := uuid.Parse(req.PathValue("chirpID"))
+
+	// Authenticate user
+	authTokenString, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		respondWithError(w, 401, fmt.Sprintf("Error fetching bearer token: %s", err))
+		return
+	}
+
+	userID, err := auth.ValidateJWT(authTokenString, cfg.secret)
+	if err != nil {
+		respondWithError(w, 401, "Invalid token")
+		return
+	}
+
+	chirp, err := cfg.db.GetChirp(req.Context(), uuid.UUID(chirpID))
+	if err != nil {
+		respondWithError(w, 404, "Chirp not found")
+		return
+	}
+
+	if chirp.UserID != userID {
+		respondWithError(w, 403, "User is not authorized to remove chirp")
+		return
+	}
+
+	// Remove the chirp
+	err = cfg.db.RemoveChirp(req.Context(), chirp.ID)
+	if err != nil {
+		respondWithError(w, 500, fmt.Sprintf("Error removing chirp: %s", err))
+		return
+	}
+
+	respondWithJSON(w, 204, nil)
+}
+
 func main() {
 	godotenv.Load(".env")
 	dbURL := os.Getenv("DB_URL")
@@ -486,6 +524,7 @@ func main() {
 	mux.HandleFunc("POST /api/refresh", apiCfg.refreshHandler)
 	mux.HandleFunc("POST /api/revoke", apiCfg.revokeHandler)
 	mux.HandleFunc("PUT /api/users", apiCfg.putUsersHandler)
+	mux.HandleFunc("DELETE /api/chirps/{chirpID}", apiCfg.deleteChirpHandler)
 
 	log.Print("Running server")
 	server.ListenAndServe()

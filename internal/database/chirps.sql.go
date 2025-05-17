@@ -96,3 +96,13 @@ func (q *Queries) GetChirps(ctx context.Context) ([]Chirp, error) {
 	}
 	return items, nil
 }
+
+const removeChirp = `-- name: RemoveChirp :exec
+DELETE FROM chirps
+WHERE id = $1
+`
+
+func (q *Queries) RemoveChirp(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.ExecContext(ctx, removeChirp, id)
+	return err
+}
