@@ -33,6 +33,7 @@ type User struct {
 	UpdatedAt time.Time `json:"updated_at"`
 	Email string        `json:"email"`
 	Token string        `json:"token"`
+	RefreshToken string `json:"refresh_token"`
 }
 
 type Chirp struct {
@@ -42,6 +43,10 @@ type Chirp struct {
 	Email string        `json:"email"`
 	Body string         `json:"body"`
 	UserId uuid.UUID    `json:"user_id"`
+}
+
+type Token struct {
+	Token string `json:"token"`
 }
 
 // Keeping track the number of times a handler has been called
@@ -155,6 +160,7 @@ func (cfg *apiConfig) addUserHandler(w http.ResponseWriter, req *http.Request) {
 	hashedPassword, err := auth.HashPassword(reqBody.Password)
 	if err != nil {
 		respondWithError(w, 500, fmt.Sprintf("Error hashing password: %s", err))
+		return
 	}
 
 	dbUser, err := cfg.db.CreateUser(req.Context(), database.CreateUserParams{
@@ -206,6 +212,7 @@ func (cfg *apiConfig) postChirpHandler(w http.ResponseWriter, req *http.Request)
 	err = decoder.Decode(&body)
 	if err != nil {
 		respondWithError(w, 500, fmt.Sprintf("Error decoding request body: %s", err))
+		return
 	}
 
 	// Check that the Chirp is valid
@@ -224,6 +231,7 @@ func (cfg *apiConfig) postChirpHandler(w http.ResponseWriter, req *http.Request)
 	})
 	if err != nil {
 		respondWithError(w, 500, fmt.Sprintf("Error creating chirp: %s", err))
+		return
 	}
 	respondWithJSON(w, 201, Chirp{
 		Id: chirp.ID,
@@ -279,7 +287,6 @@ func (cfg *apiConfig) loginHandler(w http.ResponseWriter, req *http.Request) {
 	type requestBody struct {
 		Password string      `json:"password"`
 		Email string         `json:"email"`
-		ExpiresInSeconds int `json:"expires_in_seconds"`
 	}
 
 	decoder := json.NewDecoder(req.Body)
@@ -307,17 +314,26 @@ func (cfg *apiConfig) loginHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	expiryTimeSeconds := reqBody.ExpiresInSeconds
-
-	// Token has duration up to one hour
-	expiryTimeSeconds = min(expiryTimeSeconds, 3600)
-	if expiryTimeSeconds <= 0 {
-		// Default: 1 hour
-		expiryTimeSeconds = 3600
-	}
-	tokenString, err := auth.MakeJWT(user.ID, cfg.secret, time.Duration(expiryTimeSeconds) * time.Second)
+	// Generate access token
+	tokenString, err := auth.MakeJWT(user.ID, cfg.secret, 1*time.Hour)
 	if err != nil {
-		respondWithError(w, 500, err.Error())
+		respondWithError(w, 401, err.Error())
+		return
+	}
+
+	// Generate refresh token
+	refreshTokenString, _ := auth.MakeRefreshToken()
+	token, err := cfg.db.CreateRefreshToken(req.Context(), database.CreateRefreshTokenParams{
+		Token: refreshTokenString,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		UserID: user.ID,
+		ExpiresAt: time.Now().Add(60*24*time.Hour),
+		RevokedAt: sql.NullTime{},
+	})
+	if err != nil {
+		respondWithError(w, 500, fmt.Sprintf("Error adding refresh token to database: %s", err))
+		return
 	}
 
 	userResponse := User{
@@ -326,8 +342,115 @@ func (cfg *apiConfig) loginHandler(w http.ResponseWriter, req *http.Request) {
 		UpdatedAt: user.UpdatedAt,
 		Email: user.Email,
 		Token: tokenString,
+		RefreshToken: token.Token,
 	}
 	respondWithJSON(w, 200, userResponse)
+}
+
+func (cfg *apiConfig) refreshHandler(w http.ResponseWriter, req *http.Request) {
+	refreshTokenString, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, fmt.Sprintf("Error fetching refresh token: %s", err))
+		return
+	}
+
+	token, err := cfg.db.GetRefreshToken(req.Context(), refreshTokenString)
+	if err != nil {
+		respondWithError(w, 401, fmt.Sprintf("Refresh token does not exist: %s", err))
+		return
+	}
+
+	if token.ExpiresAt.Before(time.Now()) || token.RevokedAt.Valid {
+		respondWithError(w, 401, "Refresh token has expired")
+		return
+	}
+
+	accessToken, err := auth.MakeJWT(token.UserID, cfg.secret, 1*time.Hour)
+	if err != nil {
+		respondWithError(w, 401, fmt.Sprintf("Error creating access token: %s", err))
+		return
+	}
+
+	tokenResponse := Token{Token: accessToken}
+	respondWithJSON(w, 200, tokenResponse)
+}
+
+func (cfg *apiConfig) revokeHandler(w http.ResponseWriter, req *http.Request) {
+	refreshTokenString, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, fmt.Sprintf("Error fetching refresh token: %s", err))
+		return
+	}
+
+	err = cfg.db.RevokeToken(req.Context(), refreshTokenString)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, fmt.Sprintf("Error revoking refresh token: %s", err))
+		return
+	}
+
+	respondWithJSON(w, 204, nil)
+}
+
+// Handler for updating email/password
+func (cfg *apiConfig) putUsersHandler(w http.ResponseWriter, req *http.Request) {
+	accessToken, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		respondWithError(w, 401, fmt.Sprintf("Error fetching access token: %s", err))
+		return
+	}
+
+	// Verify user
+	userID, err := auth.ValidateJWT(accessToken, cfg.secret)
+	if err != nil {
+		respondWithError(w, 401, "Invalid access token")
+		return
+	}
+
+	type requestBody struct {
+		Password string `json:"password"`
+		Email string    `json:"email"`
+	}
+
+	var reqBody requestBody
+	decoder := json.NewDecoder(req.Body)
+	err = decoder.Decode(&reqBody)
+	if err != nil {
+		respondWithError(w, 500, "Error unpacking request, expected 'email' and 'password' fields")
+		return
+	}
+
+	// Hash the new password
+	hashedPassword, err := auth.HashPassword(reqBody.Password)
+	if err != nil {
+		respondWithError(w, 500, fmt.Sprintf("Error hashing password: %s", err))
+		return
+	}
+
+	updatedUser, err := cfg.db.UpdateUserEmailPassword(req.Context(), database.UpdateUserEmailPasswordParams{
+		ID: userID,
+		Email: reqBody.Email,
+		HashedPassword: sql.NullString{
+			String: hashedPassword,
+			Valid: true, },
+	})
+	if err != nil {
+		respondWithError(w, 500, fmt.Sprintf("Error updating user: %s", err))
+		return
+	}
+
+	type response struct {
+		ID string           `json:"id"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+		Email string        `json:"email"`
+	}
+
+	respondWithJSON(w, 200, response{
+		ID: updatedUser.ID.String(),
+		CreatedAt: updatedUser.CreatedAt,
+		UpdatedAt: updatedUser.UpdatedAt,
+		Email: updatedUser.Email,
+	})
 }
 
 func main() {
@@ -360,6 +483,9 @@ func main() {
 	mux.HandleFunc("GET /api/chirps", apiCfg.getChirpsHandler)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getChirpHandler)
 	mux.HandleFunc("POST /api/login", apiCfg.loginHandler)
+	mux.HandleFunc("POST /api/refresh", apiCfg.refreshHandler)
+	mux.HandleFunc("POST /api/revoke", apiCfg.revokeHandler)
+	mux.HandleFunc("PUT /api/users", apiCfg.putUsersHandler)
 
 	log.Print("Running server")
 	server.ListenAndServe()
