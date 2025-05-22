@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -16,8 +17,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
-	"github.com/mhiillos/chirpy/internal/database"
 	"github.com/mhiillos/chirpy/internal/auth"
+	"github.com/mhiillos/chirpy/internal/database"
 )
 
 type apiConfig struct {
@@ -246,8 +247,24 @@ func (cfg *apiConfig) postChirpHandler(w http.ResponseWriter, req *http.Request)
 }
 
 func (cfg *apiConfig) getChirpsHandler(w http.ResponseWriter, req *http.Request) {
+
+	authorIDString := req.URL.Query().Get("author_id")
+	sorting := req.URL.Query().Get("sort")
+
 	var chirps []Chirp
-	dbChirps, err := cfg.db.GetChirps(req.Context())
+	var dbChirps []database.Chirp
+	var err error
+	if authorIDString != "" {
+		authorID, err := uuid.Parse(authorIDString)
+		if err != nil {
+			respondWithError(w, 500, fmt.Sprintf("Error parsing UUID: %s", err))
+			return
+		}
+
+		dbChirps, err = cfg.db.GetChirpsForUser(req.Context(), authorID)
+	} else {
+		dbChirps, err = cfg.db.GetChirps(req.Context())
+	}
 	if err != nil {
 		respondWithError(w, 500, "Error retrieving chirps")
 		return
@@ -262,6 +279,15 @@ func (cfg *apiConfig) getChirpsHandler(w http.ResponseWriter, req *http.Request)
 		}
 		chirps = append(chirps, chirp)
 	}
+
+	if sorting == "asc" {
+		sort.Slice(chirps, func (i, j int) bool { return chirps[i].CreatedAt.Before(chirps[j].CreatedAt) })
+	}
+
+	if sorting == "desc" {
+		sort.Slice(chirps, func (i, j int) bool { return chirps[i].CreatedAt.After(chirps[j].CreatedAt) })
+	}
+
 	respondWithJSON(w, 200, chirps)
 }
 
