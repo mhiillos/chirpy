@@ -25,6 +25,7 @@ type apiConfig struct {
 	db *database.Queries
 	platform string
 	secret string
+	polkaKey string
 }
 
 type User struct {
@@ -34,6 +35,7 @@ type User struct {
 	Email string        `json:"email"`
 	Token string        `json:"token"`
 	RefreshToken string `json:"refresh_token"`
+	IsChirpyRed bool    `json:"is_chirpy_red"`
 }
 
 type Chirp struct {
@@ -183,6 +185,7 @@ func (cfg *apiConfig) addUserHandler(w http.ResponseWriter, req *http.Request) {
 		CreatedAt: dbUser.CreatedAt,
 		UpdatedAt: dbUser.UpdatedAt,
 		Email: dbUser.Email,
+		IsChirpyRed: false,
 	}
 
 	respondWithJSON(w, 201, user)
@@ -343,6 +346,7 @@ func (cfg *apiConfig) loginHandler(w http.ResponseWriter, req *http.Request) {
 		Email: user.Email,
 		Token: tokenString,
 		RefreshToken: token.Token,
+		IsChirpyRed: user.IsChirpyRed.Bool,
 	}
 	respondWithJSON(w, 200, userResponse)
 }
@@ -443,6 +447,7 @@ func (cfg *apiConfig) putUsersHandler(w http.ResponseWriter, req *http.Request) 
 		CreatedAt time.Time `json:"created_at"`
 		UpdatedAt time.Time `json:"updated_at"`
 		Email string        `json:"email"`
+		IsChirpyRed bool    `json:"is_chirpy_red"`
 	}
 
 	respondWithJSON(w, 200, response{
@@ -450,6 +455,7 @@ func (cfg *apiConfig) putUsersHandler(w http.ResponseWriter, req *http.Request) 
 		CreatedAt: updatedUser.CreatedAt,
 		UpdatedAt: updatedUser.UpdatedAt,
 		Email: updatedUser.Email,
+		IsChirpyRed: updatedUser.IsChirpyRed.Bool,
 	})
 }
 
@@ -491,11 +497,51 @@ func (cfg *apiConfig) deleteChirpHandler(w http.ResponseWriter, req *http.Reques
 	respondWithJSON(w, 204, nil)
 }
 
+func (cfg *apiConfig) polkaWebhooksHandler(w http.ResponseWriter, req *http.Request) {
+
+	// Verify api key
+	apiKey, err := auth.GetAPIKey(req.Header)
+	if err != nil || apiKey != cfg.polkaKey {
+		respondWithError(w, 401, fmt.Sprintf("Invalid API key: %s", err))
+		return
+	}
+
+	type Data struct {
+		UserID uuid.UUID `json:"user_id"`
+	}
+	type requestBody struct {
+		Event string `json:"event"`
+		Data Data `json:"data"`
+	}
+
+	var reqBody requestBody
+	decoder := json.NewDecoder(req.Body)
+	err = decoder.Decode(&reqBody)
+	if err != nil {
+		respondWithError(w, 500, fmt.Sprintf("Error decoding request body: %s", err))
+		return
+	}
+
+	if reqBody.Event != "user.upgraded" {
+		respondWithJSON(w, 204, nil)
+		return
+	}
+
+	err = cfg.db.UpgradeUser(req.Context(), reqBody.Data.UserID)
+	if err != nil {
+		respondWithError(w, 404, "User not found")
+		return
+	}
+
+	respondWithJSON(w, 204, nil)
+}
+
 func main() {
 	godotenv.Load(".env")
 	dbURL := os.Getenv("DB_URL")
 	platform := os.Getenv("PLATFORM")
 	secret := os.Getenv("SECRET_KEY")
+	polkaKey := os.Getenv("POLKA_KEY")
 
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
@@ -509,6 +555,7 @@ func main() {
 	apiCfg.db = newDb
 	apiCfg.platform = platform
 	apiCfg.secret = secret
+	apiCfg.polkaKey = polkaKey
 
 	mux.Handle("/app/", apiCfg.middlewareMetricsInc(handler))
 	server := http.Server{ Handler: mux, Addr: ":8080" }
@@ -525,6 +572,7 @@ func main() {
 	mux.HandleFunc("POST /api/revoke", apiCfg.revokeHandler)
 	mux.HandleFunc("PUT /api/users", apiCfg.putUsersHandler)
 	mux.HandleFunc("DELETE /api/chirps/{chirpID}", apiCfg.deleteChirpHandler)
+	mux.HandleFunc("POST /api/polka/webhooks", apiCfg.polkaWebhooksHandler)
 
 	log.Print("Running server")
 	server.ListenAndServe()
